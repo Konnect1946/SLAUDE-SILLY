@@ -3,16 +3,19 @@ import axios from 'axios';
 import FormData from 'form-data';
 import WebSocket from 'ws';
 import config from './config.js';
-import splitMessageInTwo from './utils.js';
 
 const app = express();
 
+const rename_roles = {
+    'user': 'Human',
+    'assistant': 'Assistant',
+    'example_user': 'H',
+    'example_assistant': 'A'
+}
 
 const typingString = "\n\n_Typing…_";
 
-const maxMessageLength = 12000;
-// Overhead to take into account when splitting messages, for example, the length of "Human:"
-const messageLengthOverhead = 20;
+const maxMessageLength = config.USE_BLOCKS ? 12000 : 4000;
 
 var lastMessage = '';
 
@@ -56,6 +59,11 @@ app.post('/(.*)/chat/completions', async (req, res, next) => {
 
         console.log(`Created thread with ts ${tsThread}`);
 
+        let pingMessage = config.PING_MESSAGE;
+        if (config.MAINPROMPT_AS_PING) {
+            pingMessage = promptMessages.pop();
+        }
+
         if (promptMessages.length > 1) {
             for (let i = 1; i < promptMessages.length; i++) {
                 await createSlackReply(promptMessages[i], tsThread);
@@ -73,24 +81,18 @@ app.post('/(.*)/chat/completions', async (req, res, next) => {
                 streamQueue = streamQueue.then(streamNextClaudeResponseChunk.bind(this, message, res));
             });
 
-            timeout = setTimeout(() => {
-                console.log("Streaming response taking too long, closing stream.")
-                finishStream(res);
-            }, 2*60*1000);
+            if (config.STREAMING_TIMEOUT > 0) {
+                timeout = setTimeout(() => {
+                    console.log("Streaming response taking too long, closing stream.")
+                    finishStream(res);
+                }, config.STREAMING_TIMEOUT);
+            }
         } else {
             console.log("Awaiting Claude's response.");
             ws.on("message", (message) => {
                 getClaudeResponse(message, res);
             });
         }
-        ws.on("error", (err) => {
-            console.error(err);
-        });
-        ws.on("close", (code, reason) => {
-            if (code !== 1000 && code !== 1005) {
-                console.log(`Socket closed with code ${code} and reason ${reason}`);
-            }
-        });
 
         res.on("finish", () => {
             ws.close();
@@ -100,7 +102,7 @@ app.post('/(.*)/chat/completions', async (req, res, next) => {
             }
         });
 
-        await createClaudePing(tsThread);
+        await createClaudePing(pingMessage, tsThread);
         console.log(`Created Claude ping on thread ${tsThread}`);
     } catch (error) {
         console.error(error);
@@ -145,7 +147,7 @@ function openWebSocketConnection() {
     return new Promise((resolve, reject) => {
         setTimeout(() => {
             reject('Timed out establishing WebSocket connection.');
-        }, 10000);
+        }, 30000);
 
         var ws = new WebSocket(`wss://wss-primary.slack.com/?token=${config.TOKEN}`, {
             headers: {
@@ -191,32 +193,6 @@ function stripTyping(text) {
     return text.slice(0, text.length-typingString.length);
 }
 
-const blacklisted_threads = new Set();
-// better way would be to register whitelisted threads, when you create them
-// and them unregistering them when you're done getting the message
-function isMessageValid(messsageData) {
-    if (!messsageData.message) {
-        return true
-    }
-    let senderID = messsageData.user;
-    if (!senderID) {
-        if (messsageData.message.user) {
-            senderID = messsageData.message.user
-        }
-    }
-    if (senderID && senderID !== config.CLAUDE_USER) {
-        // if not from Claude, happens sometimes if last thread is still going somehow
-        // console.log("Message from socket not from Claude but from ID =", senderID, JSON.stringify(messsageData.message.text.slice(0, 55).trim()))
-        return false;
-    }
-    if (messsageData.message.thread_ts && blacklisted_threads.has(messsageData.message.thread_ts)) {
-        console.log("Intended: Ignoring Claude sending message in old thread ", messsageData.message.thread_ts)
-        // console.log(JSON.stringify(messsageData.message.text.slice(0, 55).trim()))
-        return false
-    }
-    return true;
-}
-
 /** 
  * Used as a callback for WebSocket to get the next chunk of the response Claude is currently typing and
  * write it into the response for SillyTavern. Used for streaming.
@@ -227,26 +203,13 @@ function streamNextClaudeResponseChunk(message, res) {
     return new Promise((resolve, reject) => {
         try {
             let data = JSON.parse(message);
-            if (!isMessageValid(data)) {
-                resolve();
-                return;
-            }
             if (data.subtype === 'message_changed') {
                 let text = data.message.text;
                 let stillTyping = text.endsWith(typingString);
                 text = stillTyping ? stripTyping(text) : text;
-                const textUncropped = text
-                text = cropText(text)
-                if (textUncropped.length > text.length) {
-                    stillTyping = false
-                    if (data.message.thread_ts) {
-                        blacklisted_threads.add(data.message.thread_ts);
-                        console.log("Message thread stopped early ", data.message.thread_ts)
-                    }
-                }
                 let chunk = getNextChunk(text);
 
-                if (chunk.length === 0 && stillTyping) {
+                if (chunk.length === 0) {
                     resolve();
                     return;
                 }
@@ -258,11 +221,8 @@ function streamNextClaudeResponseChunk(message, res) {
                         }
                     }]
                 };
-                try {
-                    res.write('\ndata: ' + JSON.stringify(streamData));
-                } catch (error) {
-                    console.error(error)
-                }
+            
+                res.write('\ndata: ' + JSON.stringify(streamData));
     
                 if (!stillTyping) {
                     finishStream(res);
@@ -276,19 +236,6 @@ function streamNextClaudeResponseChunk(message, res) {
     });
 }
 
-function cropText(text) {
-    if (config.stop_message_when_string_is_found) {
-        for (let summaryCrop of config.stop_message_when_string_is_found) {
-            let cropIdx = text.indexOf(summaryCrop)
-            if (cropIdx > 0) {
-                console.warn("config.stop_message_when_string_is_found: CROPPING TEXT AT IDX =", cropIdx, " TEXT CROPPED =", JSON.stringify(text.slice(cropIdx, cropIdx + 20).trim()), " START OF TEXT =", JSON.stringify(text.slice(0, 20).trim()))
-                text = text.slice(0, cropIdx)
-            }
-        }
-    }
-    return text
-}
-
 /**
  * Used as a callback for WebSocket to get Claude's response. Won't actually do anything until Claude stops "typing"
  * and then send it back to SillyTavern as an OpenAI chat completion result. Used when not streaming.
@@ -298,45 +245,18 @@ function cropText(text) {
 function getClaudeResponse(message, res) {
     try {
         let data = JSON.parse(message);
-        if (!isMessageValid(data)) {
-            if (lastMessage && lastMessage.length > 0) {
-                console.warn("MESSAGE INCOMPLETE, CLAUDE SENDING FILE")
-                const content = lastMessage
-                lastMessage = ''
-                res.json({
-                    choices: [{
-                        message: {
-                            content: content,
-                        }
-                    }]
-                });
-            }
-            return;
-        }
         if (data.subtype === 'message_changed') {
-            let text = data.message.text
-            let stillTyping = text.endsWith(typingString);
-            const textUncropped = text
-            text = cropText(text)
-            if (textUncropped.length > text.length) {
-                stillTyping = false
-                if (data.message.thread_ts) {
-                    blacklisted_threads.add(data.message.thread_ts);
-                    console.log("Message thread stopped early ", data.message.thread_ts, " blacklisted_threads =", blacklisted_threads)
-                }
-            }
-            if (!stillTyping) {
+            if (!data.message.text.endsWith(typingString)) {
                 res.json({
                     choices: [{
                         message: {
-                            content: text
+                            content: data.message.text
                         }
                     }]
                 });
             } else {
                 // mostly just leaving this log in since there is otherwise zero feedback that something is incoming from Slack
-                lastMessage = text
-                console.log(`received ${text.length} characters...`);
+                console.log(`received ${data.message.text.length} characters...`);
             }
         }
     } catch (error) {
@@ -350,16 +270,9 @@ function getClaudeResponse(message, res) {
  * @param {*} res - The Response object for SillyTavern's request
  */
 function finishStream(res) {
-    try {
-        res.write('\ndata: [DONE]');
-    } catch (error) {
-        console.error(error)
-    }
-    try {
-        res.end();
-    } catch (error) {
-        console.error(error)
-    }
+    lastMessage = '';
+    res.write('\ndata: [DONE]');
+    res.end();
 }
 
 /**
@@ -372,49 +285,88 @@ function finishStream(res) {
 function buildSlackPromptMessages(messages) {
     let prompts = [];
     let currentPrompt = '';
+    let mainPrompt = '';
+    if (config.MAINPROMPT_LAST || config.MAINPROMPT_AS_PING) {
+        let firstMessage = convertToPrompt(messages[0]);
+        let index = firstMessage.indexOf('\n\n');
+
+        if (index > 0) {
+            mainPrompt = firstMessage.slice(0, index);
+            currentPrompt = firstMessage.slice(index, firstMessage.length);
+            if (currentPrompt.length > maxMessageLength) {
+                currentPrompt = splitPrompt(currentPrompt, prompts);
+            }
+            messages.shift();
+        } else {
+            console.warn("Unable to determine cutoff point for main prompt, reverting to default behavior.");
+            config.MAINPROMPT_LAST = false;
+            config.MAINPROMPT_AS_PING = false;
+        }
+    }
+
     for (let i = 0; i < messages.length; i++) {
         let msg = messages[i];
-        let promptPart = convertToPrompt(msg, i);
+        let promptPart = convertToPrompt(msg);
         if (currentPrompt.length + promptPart.length < maxMessageLength) {
             currentPrompt += promptPart;
         } else {
-            if (currentPrompt.length > 0) {
-                prompts.push(currentPrompt);
-            }
-            // edge case where a single message is bigger than allowed
-            if (promptPart.length > maxMessageLength) {
-                let split = splitMessageInTwo(msg.content, maxMessageLength - messageLengthOverhead, 500)
-                messages.splice(i + 1, 0, { ...msg, content: split[1], role: ""})
-                promptPart = convertToPrompt({ ...msg, content: split[0] }, i);
-            }
+            prompts.push(currentPrompt);
             currentPrompt = promptPart;
+            if (currentPrompt.length > maxMessageLength) {
+                currentPrompt = splitPrompt(currentPrompt, prompts);
+            }
         }
     }
     prompts.push(currentPrompt);
+
+    if (config.MAINPROMPT_LAST || config.MAINPROMPT_AS_PING) {
+        prompts.push(mainPrompt);
+    }
+
     return prompts;
+}
+
+function splitPrompt(text, prompts) {
+    let whiteSpaceMatch = text.slice(0, maxMessageLength).match(/\s(?=[^\s]*$)/);
+    let splitIndex = whiteSpaceMatch === null ? maxMessageLength : whiteSpaceMatch.index + 1;
+    prompts.push(text.slice(0, splitIndex));
+    let secondHalf = text.slice(splitIndex, text.length);
+    if (secondHalf > maxMessageLength) {
+        return splitPrompt(secondHalf, prompts);
+    }
+    return secondHalf;
 }
 
 /**
  * Takes an OpenAI message and translates it into a format of "Role: Message"
  * Messages from the System role are send as is.
  * For example dialogue it takes the actual role from the 'name' property instead.
- * By default the role "user" is replaced with "Human" and the role "assistant" with "Assistant"
+ * By default the role "user" is replaced with "Human" and the role "assistant" with "Assitant"
  * @param {*} msg 
  * @returns 
  */
-function convertToPrompt(msg, idx) {
-    if (config.dont_send_user_role_if_first_message && idx == 0 && (msg.role === 'system' || msg.role === 'user')) {
-        return `${msg.content}\n\n`
-    }
+function convertToPrompt(msg) {
     if (msg.role === 'system') {
         if ('name' in msg) {
-            return `${config.rename_roles[msg.name]}: ${msg.content}\n\n`
+            return `${rename_roles[msg.name]}: ${msg.content}\n\n`
+        }
+        else {
+            return `${msg.content}\n\n`
         }
     }
-    if (config.rename_roles[msg.role]) {
-        return `${config.rename_roles[msg.role]}: ${msg.content}\n\n`
+    else {
+        return `${rename_roles[msg.role]}: ${msg.content}\n\n`
     }
-    return `${msg.content}\n\n`
+}
+
+function preparePingMessage(msg) {
+    const claudePing = `<@${config.CLAUDE_USER}>`;
+    let claudePingMatch = msg.match(/@Claude/i);
+    if (claudePingMatch === null) {
+        return `${claudePing} ${msg}`;
+    }
+
+    return msg.replace(claudePingMatch[0], claudePing);
 }
 
 /**
@@ -440,38 +392,25 @@ async function postSlackMessage(msg, thread_ts, pingClaude) {
         form.append('thread_ts', thread_ts);
     }
 
-    let blocks = [{
-        'type': 'rich_text',
-        'elements': [{
-            'type': 'rich_text_section',
-            'elements': []
-        }]
-    }];
-    if (!pingClaude) {
-        blocks[0].elements[0].elements.push({
-            'type': 'text',
-            'text': msg
-        });
-    } else {
-        if (config.PING_MESSAGE_PREFIX) {
-            blocks[0].elements[0].elements.push({
-                'type': 'text',
-                'text': config.PING_MESSAGE_PREFIX
-            }); 
-        }
-        blocks[0].elements[0].elements.push({
-            'type': 'user',
-            'user_id': config.CLAUDE_USER
-        });
-        if (config.PING_MESSAGE) {
-            blocks[0].elements[0].elements.push({
-                'type': 'text',
-                'text': config.PING_MESSAGE
-            });
-        }
+    if (pingClaude) {
+        msg = preparePingMessage(msg);
     }
 
-    form.append('blocks', JSON.stringify(blocks));
+    if (config.USE_BLOCKS) {
+        let blocks = [{
+            'type': 'rich_text',
+            'elements': [{
+                'type': 'rich_text_section',
+                'elements': [{
+                    'type': 'text',
+                    'text': msg
+                }]
+            }]
+        }];
+        form.append('blocks', JSON.stringify(blocks));
+    } else {
+        form.append('text', msg);
+    }
 
     var res = await axios.post(`https://${config.TEAM_ID}.slack.com/api/chat.postMessage`, form, {
         headers: {
@@ -504,7 +443,6 @@ async function createSlackReply(promptMsg, ts) {
     return await postSlackMessage(promptMsg, ts, false);
 }
 
-async function createClaudePing(ts) {
-    lastMessage = '';
-    return await postSlackMessage(null, ts, true);
+async function createClaudePing(promptMsg, ts) {
+    return await postSlackMessage(promptMsg, ts, true);
 }
