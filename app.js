@@ -14,17 +14,61 @@ const maxMessageLength = 12000;
 // Overhead to take into account when splitting messages, for example, the length of "Human:"
 const messageLengthOverhead = 20;
 
-function console_log(...args) {
+function getDateFormatted() {
     const currentDate = new Date();
     const milliseconds = currentDate.getMilliseconds().toString().padStart(3, '0');
-    const formattedDate = `${currentDate.toISOString().split("T")[0]} ${currentDate.toTimeString().split(" ")[0]}.${milliseconds}`;
-
-    console.log(`[${formattedDate}]`, ...args);
+    const dateFormatted = `${currentDate.toISOString().split("T")[0]} ${currentDate.toTimeString().split(" ")[0]}.${milliseconds}`;
+    return dateFormatted
 }
-function waitTimout(ms) {
+
+function console_log(...args) {
+    console.log(`[${getDateFormatted()}]`, ...args);
+}
+function console_error(...args) {
+    console.error(`[${getDateFormatted()}]`, ...args);
+}
+
+async function waitTimout(ms) {
+    if (!ms) {
+        return;
+    }
     return new Promise((resolve) => {
         setTimeout(resolve, ms);
     });
+}
+
+function clearTimeoutA(timeout) {
+    if (typeof timeout.clear === 'function') {
+        timeout.clear()
+        return;
+    }
+    clearTimeout(timeout);
+}
+
+class timeoutA {
+    constructor(callback, delay) {
+        this.startTime = Date.now();
+        this.delay = delay;
+        this.timerId = setTimeout(() => {
+            callback();
+            this.timerId = null;
+        }, delay);
+    }
+
+    getRemainingTime() {
+        if (this.timerId === null) {
+            return 0; // Timer has already executed
+        }
+        const elapsedTime = Date.now() - this.startTime;
+        return Math.max(0, this.delay - elapsedTime);
+    }
+
+    clear() {
+        if (this.timerId) {
+            clearTimeoutA(this.timerId);
+            this.timerId = null;
+        }
+    }
 }
 
 
@@ -39,14 +83,14 @@ const generatedTextFiltered = (text, finished) => {
         if (finished) {
             if (config.auto_swipe_minimum_length) {
                 if (text.length < config.auto_swipe_minimum_length && text.length !== 0) {
-                    console.log("Generated text size too small")
+                    console_log("Generated text size too small")
                     return true
                 }
             }
         }
         if (config.auto_swipe_blacklist_threshold) {
             if (containsBlacklistedWords(text, config.auto_swipe_blacklist, config.auto_swipe_blacklist_threshold)) {
-                console.log("Generated text has blacklisted words")
+                console_log("Generated text has blacklisted words")
                 return true
             }
         }
@@ -63,6 +107,109 @@ app.get('/(.*)/models', (req, res) => {
         data: [{id: 'claude-v1', object: 'model', created: Date.now(), owned_by: 'anthropic', permission: [], root: 'claude-v1', parent: null}]
     });
 });
+
+
+const retryRequest = async (thread) => {
+    if (thread.timeout) {
+        clearTimeoutA(thread.timeout);
+    }
+    if (thread.streamQueue) {
+        thread.streamQueue = Promise.resolve(undefined);
+    }
+    if (thread.lastMessageTs) {
+        console_error("This shouldn't happen, ending?")
+        try {
+            thread.res.end();
+        } catch (error) {
+            console_error(error)
+        }
+        return;
+    }
+    thread.retryCount++;
+    if (thread.retryCount <= config.retry_count) {
+        try {
+            console_log(`Failed on try ${thread.retryCount}. retrying...`);
+            await makeRequestToSlack(thread);
+        } catch (error) {
+            console_error(`Error on retry ${thread.retryCount}`)
+            console_error(error)
+        }
+        return
+    }
+    console_log("Response taking too long to start, ending.")
+    try {
+        thread.res.end();
+    } catch (error) {
+        console_error(error)
+    }
+
+}
+
+async function makeRequestToSlack(thread) {
+    let threadTs = await createSlackThread(thread.promptMessages[0]);
+
+    if (threadTs === null || threadTs === undefined) {
+        throw new Error("First message did not return a thread timestamp. Make sure that CHANNEL is set to a channel ID that both your Slack user and Claude have access to.")
+    }
+    
+    thread.ts = threadTs
+    thread.lastMessage = ""
+    thread.ClaudeTsSet = new Set()
+    thread.ClaudeTsBlacklist = new Set()
+    thread.messageUpdateCount = {}
+    thread.totalMessagesCount = 0
+
+    thread.retry_count_edit = config.retry_count_edit
+
+    console_log(`Created thread with ts ${thread.ts}`);
+
+    if (thread.promptMessages.length > 1) {
+        for (let i = 1; i < thread.promptMessages.length; i++) {
+            await createSlackReply(thread.promptMessages[i], thread.ts);
+            console_log(`Created ${i}. reply on thread ${thread.ts}`);
+        }
+    }
+
+    if (!thread.ws) {
+        thread.ws = await openWebSocketConnection(thread.res);
+        if (thread.stream) {
+            console_log("Opened stream for Claude's response.");
+            thread.streamQueue = Promise.resolve();
+            thread.ws.on("message", (message) => {
+                thread.streamQueue = thread.streamQueue.then(streamNextClaudeResponseChunk.bind(this, message, thread.res, thread));
+            });
+        } else {
+            console_log("Awaiting Claude's response.");
+            thread.ws.on("message", (message) => {
+                getClaudeResponse(message, thread.res, thread);
+            });
+        }
+        thread.ws.on("error", (err) => {
+            console_error(err);
+        });
+        thread.ws.on("close", (code, reason) => {
+            console_log(`Closed socket on thread ${thread.ts}`)
+        });
+    }
+
+    if (config.reply_timeout_delay) {
+        thread.timeout = new timeoutA(async () => { retryRequest(thread) }, config.reply_timeout_delay);
+    }
+
+    if (config.edit_msg_with_ping) {
+        // if you don't wait, Slack can go weird, needs more testing
+        await waitTimout(config.delay_before_edit)
+        for (let i = 0; i < config.multi_response; i++) {
+            await claudePingEdit(thread.promptMessages[0], thread.ts);
+            await waitTimout(config.multi_response_delay)
+            if (thread.lastMessageTs) {
+                break;
+            }
+        }
+    } else {
+        await createClaudePing(thread.ts);
+    }
+}
 
 /** 
  * SillyTavern calls this endpoint for prompt completion, if streaming is enabled it will stream Claude's response back to SillyTavern
@@ -81,89 +228,33 @@ app.post('/(.*)/chat/completions', async (req, res, next) => {
     }
 
     try {
-        let streamQueue = Promise.resolve();
-
-        let stream = req.body.stream ?? false;
         let promptMessages = buildSlackPromptMessages(req.body.messages);
-
-        let threadTs = await createSlackThread(promptMessages[0]);
-
-        if (threadTs === null || threadTs === undefined) {
-            throw new Error("First message did not return a thread timestamp. Make sure that CHANNEL is set to a channel ID that both your Slack user and Claude have access to.")
-        }
-
         let thread = {
-            ts: threadTs,
-            lastMessage: "",
             promptMessages,
-            ClaudeTsSet: new Set(),
-            ClaudeTsBlacklist: new Set(),
-            messageUpdateCount: {},
-            totalMessagesCount: 0,
-        }
-        console_log(`Created thread with ts ${thread.ts}`);
-
-        if (promptMessages.length > 1) {
-            for (let i = 1; i < promptMessages.length; i++) {
-                await createSlackReply(promptMessages[i], thread.ts);
-                console_log(`Created ${i}. reply on thread ${thread.ts}`);
-            }
+            retryCount: 0,
+            streamQueue: Promise.resolve(),
+            stream: req.body.stream ?? false,
+            req,
+            res,
         }
 
-        let ws = await openWebSocketConnection(res);
-
-        if (stream) {
-            console_log("Opened stream for Claude's response.");
-            streamQueue = Promise.resolve();
-            ws.on("message", (message) => {
-                streamQueue = streamQueue.then(streamNextClaudeResponseChunk.bind(this, message, res, thread));
-            });
-        } else {
-            console_log("Awaiting Claude's response.");
-            ws.on("message", (message) => {
-                getClaudeResponse(message, res, thread);
-            });
-            if (config.reply_timeout_delay) {
-                thread.timeout = setTimeout(() => {
-                    console_log("Response taking too long, ending.")
-                    try {
-                        res.end();
-                    } catch (error) {
-                        console.error(error)
-                    }
-                }, config.reply_timeout_delay);
-            }
-        }
-        ws.on("error", (err) => {
-            console.error(err);
-        });
-        ws.on("close", (code, reason) => {
-            console_log(`Closed socket on thread ${thread.ts}`)
-        });
-
-        res.on("finish", () => {
-            ws.close();
-            console_log("Finished returning Claude's response.");
+        res.on("finish", async () => {
             if (thread.timeout) {
-                clearTimeout(thread.timeout);
+                clearTimeoutA(thread.timeout);
             }
-        });
-
-        if (config.edit_msg_with_ping) {
-            // if you don't wait, there's a chance Slack triggers Claude twice
-            for (let i = 0; i < config.multi_response; i++){
-                await claudePingEdit(thread.promptMessages[0], thread.ts);
-                await waitTimout(config.multi_response_delay)
-                if (thread.lastMessageTs) {
-                    break;
+            if (thread.ws) {
+                try {
+                    thread.ws.close();
+                } catch (error) {
+                    console_error(error)
                 }
             }
-        } else {
-            await createClaudePing(thread.ts);
-            console_log(`Created Claude ping on thread ${thread.ts}`);
-        }
+            console_log("Finished returning Claude's response.");
+        });
+
+        await makeRequestToSlack(thread);
     } catch (error) {
-        console.error(error);
+        console_error(error);
         next(error);
     }
 });
@@ -204,7 +295,7 @@ function checkConfig() {
     }
     Math.max(1, config.multi_response)
     if (!config.multi_response_delay) {
-        config.multi_response_delay = 100
+        config.multi_response_delay = 50
     }
     Math.max(10, config.multi_response_delay)
 }
@@ -233,7 +324,7 @@ function openWebSocketConnection(res) {
             } catch (error) {
             }
             if (code !== 1000 && code !== 1005) {
-                console.error(`WebSocket connection closed abnormally with code ${code} and reason ${reason}. Your cookie and/or token might be incorrect or expired.`)
+                console_error(`WebSocket connection closed abnormally with code ${code} and reason ${reason}. Your cookie and/or token might be incorrect or expired.`)
             }
         })
     });
@@ -334,8 +425,7 @@ function isNewestMessage(data, thread) {
 function isMessageBlacklisted(data, thread) {
     if (thread.ClaudeTsBlacklist) {
         if (!data.message.ts || thread.ClaudeTsBlacklist.has(data.message.ts)) {
-            console_log("Intended: Ignoring Claude's old message ", data.message.ts)
-            console_log(JSON.stringify(data.message.text.slice(0, 33).trim()))
+            console_log("\t Intended: Ignoring Claude's old message ", data.message.ts, JSON.stringify(data.message.text.slice(0, 33).trim()))
             return true
         }
     }
@@ -374,19 +464,10 @@ function streamNextClaudeResponseChunk(message, res, thread) {
                 return;
             }
             if (data.subtype === 'message_changed') {
-                if (thread.timeout) {
-                    clearTimeout(thread.timeout);
-                    if (config.reply_timeout_delay) {
-                        thread.timeout = setTimeout(() => {
-                            console_log("Streaming response taking too long, closing stream.")
-                            finishStream(res);
-                        }, config.reply_timeout_delay);
-                    }
-                }
                 if (thread.finishTimeout) {
-                    console_log("thread.finishTimeout cleared")
-                    clearTimeout(thread.finishTimeout);
+                    clearTimeoutA(thread.finishTimeout);
                     thread.finishTimeout = null;
+                    console_log("thread.finishTimeout cleared")
                 }
                 thread.ClaudeTsSet.add(data.message.ts)
 
@@ -413,13 +494,39 @@ function streamNextClaudeResponseChunk(message, res, thread) {
                     return;
                 }
                 if (text.length <= config.auto_swipe_prebuffer_length) {
-                    console_log(`Checking message ${data.message.ts}`)
+                    console_log(`Checking message ${data.message.ts} ${text.slice(0, 33).trim()} [...]`)
                     if (generatedTextFiltered(text, !stillTyping)) {
                         thread.ClaudeTsBlacklist.add(data.message.ts)
                         thread.ClaudeTsSet.delete(data.message.ts)
                         thread.totalMessagesCount++;
-                        console_log(`\t Filtered message  ${data.message.ts}, retrying...`)
-                        claudePingEdit(thread.promptMessages[0], thread.ts);
+                        console_log(`\t Filtered message ${data.message.ts}`)
+                        if (config.edit_msg_with_ping && thread.retry_count_edit) {
+                            thread.retry_count_edit--;
+                            console_log(`\t edit retries left ${thread.retry_count_edit}...`)
+                            claudePingEdit(thread.promptMessages[0], thread.ts);
+                        } else {
+                            if (thread.timeout) {
+                                clearTimeoutA(thread.timeout);
+                            }
+                            let repliesPerRequest = 1;
+                            if (config.edit_msg_with_ping) {
+                                repliesPerRequest = config.multi_response;
+                                repliesPerRequest += config.retry_count_edit;
+                                repliesPerRequest--;
+                            }
+                            const repliesLeft = repliesPerRequest - thread.ClaudeTsBlacklist.size
+                            console_log(`\t replies ${thread.ClaudeTsBlacklist.size}/${repliesPerRequest}`)
+                            console_log(`\t repliesLeft ${repliesLeft}`)
+                            if (repliesLeft === 0) {
+                                console_log(`\t retrying from repliesLeft = ${repliesLeft}`);
+                                retryRequest(thread)
+                            } else {
+                                thread.timeout = new timeoutA(async () => {
+                                    console_log(`\t retrying from repliesLeft = ${repliesLeft}`);
+                                    retryRequest(thread);
+                                }, repliesLeft * config.reply_multi_timeout_delay);
+                            }
+                        }
                         resolve();
                         return;
                     }
@@ -460,6 +567,15 @@ function streamNextClaudeResponseChunk(message, res, thread) {
                     console_log(`Passed filters: ${data.message.ts}`)
                     console_log(`\tfinal message ${data.message.ts} from ${JSON.stringify(thread.messageUpdateCount)}`)
                 }
+                if (thread.timeout) {
+                    clearTimeoutA(thread.timeout);
+                    if (config.reply_update_timeout_delay) {
+                        thread.timeout = new timeoutA(() => {
+                            console_log("Streaming response taking too long to update, closing stream.")
+                            finishStream(res);
+                        }, config.reply_update_timeout_delay);
+                    }
+                }
 
                 let chunk = getNextChunk(text, thread);
 
@@ -467,18 +583,18 @@ function streamNextClaudeResponseChunk(message, res, thread) {
                     resolve();
                     return;
                 }
-                console_log(`Got ${chunk.length} characters from thread ${thread.ts}; post ${data.message.ts}; ${chunk}`)
+                console_log(`Got ${chunk.length} characters from thread ${thread.ts}; post ${data.message.ts}; ${chunk.slice(0, 33).trim()} [...]`)
                 let streamData = {
                     choices: [{
                         delta: {
-                            content: chunk
+                            content: chunk,
                         }
                     }]
                 };
                 try {
                     res.write('\ndata: ' + JSON.stringify(streamData));
                 } catch (error) {
-                    console.error(error)
+                    console_error(error)
                 }
     
                 if (!stillTyping) {
@@ -488,7 +604,7 @@ function streamNextClaudeResponseChunk(message, res, thread) {
             }
             resolve();
         } catch (error) {
-            console.error('Error parsing Slack WebSocket message');
+            console_error('Error parsing Slack WebSocket message');
             reject(error);
         }
     });
@@ -537,16 +653,6 @@ function getClaudeResponse(message, res, thread) {
             return;
         }
         if (data.subtype === 'message_changed') {
-            if (thread.timeout) {
-                clearTimeout(thread.timeout);
-                if (config.reply_timeout_delay) {
-                    thread.timeout = setTimeout(() => {
-                        console_log("Streaming response taking too long, closing stream.")
-                        finishStream(res);
-                    }, config.reply_timeout_delay);
-                }
-            }
-
 
             let text = data.message.text
             let stillTyping = text.endsWith(typingString);
@@ -574,8 +680,33 @@ function getClaudeResponse(message, res, thread) {
                     thread.ClaudeTsBlacklist.add(data.message.ts)
                     thread.ClaudeTsSet.delete(data.message.ts)
                     thread.totalMessagesCount++;
-                    console_log(`\t Filtered message  ${data.message.ts}, retrying...`)
-                    claudePingEdit(thread.promptMessages[0], thread.ts);
+                    if (config.edit_msg_with_ping && thread.retry_count_edit) {
+                        thread.retry_count_edit--;
+                        console_log(`\t Filtered message ${data.message.ts}, retries left ${thread.retry_count_edit}...`)
+                        claudePingEdit(thread.promptMessages[0], thread.ts);
+                    } else {
+                        if (thread.timeout) {
+                            clearTimeoutA(thread.timeout);
+                        }
+                        let repliesPerRequest = 1;
+                        if (config.edit_msg_with_ping) {
+                            repliesPerRequest = config.multi_response;
+                            repliesPerRequest += config.retry_count_edit;
+                            repliesPerRequest--;
+                        }
+                        const repliesLeft = repliesPerRequest - thread.ClaudeTsBlacklist.size
+                        console_log(`\t replies ${thread.ClaudeTsBlacklist.size}/${repliesPerRequest}`)
+                        console_log(`\t repliesLeft ${repliesLeft}`)
+                        if (repliesLeft === 0) {
+                            console_log(`\t retrying from repliesLeft = ${repliesLeft}`);
+                            retryRequest(thread)
+                        } else {
+                            thread.timeout = new timeoutA(async () => {
+                                console_log(`\t retrying from repliesLeft = ${repliesLeft}`);
+                                retryRequest(thread);
+                            }, repliesLeft * config.reply_multi_timeout_delay);
+                        }
+                    }
                     return;
                 }
                 if (stillTyping) {
@@ -613,22 +744,43 @@ function getClaudeResponse(message, res, thread) {
                 console_log(`\tfinal message ${data.message.ts} from ${JSON.stringify(thread.messageUpdateCount)}`)
             }
 
+            // log to give feedback that something is incoming from Slack
+            thread.lastMessage = text
+            console_log(`received ${text.length} characters...`);
+
+            if (thread.timeout) {
+                clearTimeoutA(thread.timeout);
+                if (config.reply_update_timeout_delay) {
+                    thread.timeout = new timeoutA(() => {
+                        console_log("Response taking too long to update, ending.")
+                        try {
+                            res.json({
+                                choices: [{
+                                    message: {
+                                        content: thread.lastMessage,
+                                    }
+                                }]
+                            });
+                        } catch (error) {
+                            console.warn(error)
+                        }
+                    }, config.reply_update_timeout_delay);
+                }
+            }
+
+
             if (!stillTyping) {
                 res.json({
                     choices: [{
                         message: {
-                            content: text
+                            content: thread.lastMessage,
                         }
                     }]
                 });
-            } else {
-                // mostly just leaving this log in since there is otherwise zero feedback that something is incoming from Slack
-                thread.lastMessage = text
-                console_log(`received ${text.length} characters...`);
             }
         }
     } catch (error) {
-        console.error('Error parsing Slack WebSocket message:', error);
+        console_error('Error parsing Slack WebSocket message:', error);
     }
 }
 
@@ -641,12 +793,12 @@ function finishStream(res) {
     try {
         res.write('\ndata: [DONE]');
     } catch (error) {
-        console.error(error)
+        console_error(error)
     }
     try {
         res.end();
     } catch (error) {
-        console.error(error)
+        console_error(error)
     }
 }
 
@@ -806,9 +958,10 @@ async function claudePingEdit(promptMsg, threadTs) {
         msg_with_ping = promptMsg + "\n" + ping
     }
     await postSlackMessage(msg_with_ping, null, false, threadTs);
-    console_log(`Added Claude ping on thread ${threadTs}`);
+    console_log(`Added Claude ping on ts ${threadTs}`);
 }
 
 async function createClaudePing(ts) {
-    return await postSlackMessage(null, ts, true);
+    await postSlackMessage(null, ts, true);
+    console_log(`Created Claude ping on ts ${ts}`);
 }

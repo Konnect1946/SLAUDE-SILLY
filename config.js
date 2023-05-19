@@ -35,7 +35,7 @@ const config = {
         'user': 'H',
         'assistant': 'A',
         'example_user': 'H',
-        'example_assistant': 'A'
+        'example_assistant': 'A',
     },
 
     minimum_split_size: 500,
@@ -44,10 +44,13 @@ const config = {
     stop_message_when_string_is_found: [
         "\nH: ",
         "\nHuman: ",
+        "<EOT>",
     ],
 
+    // redo the request up to this amount, if it fails
+    retry_count: 5,
 
-    auto_swipe: true,
+    // Automatically fail request if it doesn't pass the below criteria:
     // Be careful with `auto_swipe_minimum_length`, as it will not allow short messages through, set it to 0 if this is undersirable
     // 0 to disable
     auto_swipe_minimum_length: 0,
@@ -55,7 +58,7 @@ const config = {
     // 0 to disable
     auto_swipe_blacklist_threshold: 2,
     auto_swipe_blacklist: [
-        "ethical",
+        "ethical(ly)?",
         "unethical",
         "guidelines?",
         "harmful",
@@ -65,15 +68,36 @@ const config = {
         "generat(e|ing)",
         "nonconsensual",
         "I apologize",
-        "(unable to|not) provide",
+        "My apologies",
+        "upon further reflection",
+        "continue this story",
+        "(unable to|not) (continue|respond|provide|appropriate)",
         "inappropriate",
         "content",
-        "(unable to) continue",
     ],
     // wait before starting to send text, lest it be filtered
     auto_swipe_prebuffer_length: 200,
 
-    reply_timeout_delay: 1 * 60 * 1000,
+    // if edit_msg_with_ping: true
+    // request multiple Claude replies
+    // WARN: if you this above 5 you are fucking yourself over because:
+    // * it seems like there's a limited amount of Claude responses at the same time for each workspace, so you'll have to wait for every request to finish to get your next ones
+    // * requests might poison one another, if one takes too long to start, maybe
+    multi_response: 3,
+    // delay between edits, could possibly be lower, didn't test it
+    multi_response_delay: 50,
+    // edit more times if the initial `multi_response` few get filtered
+    // possibly bad
+    retry_count_edit: 0,
+    // Slack is weird, wait a bit before editting or it won't trigger Claude
+    delay_before_edit: 100,
+        
+    // timeout if reply is taking too long to start being received
+    reply_timeout_delay: 30 * 1000,
+    // timeout if waiting just for the last multi reply
+    reply_multi_timeout_delay: 2 * 1000,
+    // timeout if reply is message is taking too long to update more
+    reply_update_timeout_delay: 10 * 1000,
 
     PORT: 5004,
 }
