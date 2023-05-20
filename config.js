@@ -1,5 +1,5 @@
 const config = {
-    TOKEN: "xoxc-5223983272914-5209434237703-5223851958611-43d053366901493a00d7fded7409c304be3df109beac5b22d34d1b74c90b0f63",
+     TOKEN: "xoxc-5223983272914-5209434237703-5223851958611-43d053366901493a00d7fded7409c304be3df109beac5b22d34d1b74c90b0f63",
     COOKIE: "xoxd-pURc6vS%2FdbZ8ynWMZ3xCZsdq59qy7hgMY5btT6CN7%2BF%2FCq9AdBuGkUtsY0Kwah9aH2G00Dk%2BhEM4O8Y9xJ49dUKw2Xr1u3t5NKp%2Bzv7ANI5dkaSkS3NEH2MdGZn3TbTL9lm4w6UsqMUWpJ9igVRF9zInqn4m5c%2BOSQeDmo0iVylI%2F%2BJ4yahiauB5Kw%3D%3D",
     TEAM_ID: "konnect-4",
     CHANNEL: "C0565CS79D5",
@@ -89,13 +89,15 @@ const config = {
     // edit more times if the initial `multi_response` few get filtered
     // possibly bad
     retry_count_edit: 0,
-    // Slack is weird, wait a bit before editting or it won't trigger Claude
-    delay_before_edit: 100,
+    // Slack is weird, wait a bit before editting or
+    // it won't trigger Claude
+    // it won't get all context
+    delay_before_edit: 400,
         
     // timeout if reply is taking too long to start being received
     reply_timeout_delay: 30 * 1000,
     // timeout if waiting just for the last multi reply
-    reply_multi_timeout_delay: 2 * 1000,
+    reply_multi_timeout_delay: 6 * 1000,
     // timeout if reply is message is taking too long to update more
     reply_update_timeout_delay: 10 * 1000,
 
