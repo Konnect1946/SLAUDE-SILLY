@@ -1,9 +1,9 @@
 const config = {
-    TOKEN: "xoxc-5223983272914-5209434237703-5292629340182-1e0f91531a3a9cb84651e922bc539c048a2465be6b3b491b93794fc3c439a96e",
-    COOKIE: "xoxd-V8XUcKFISiuzLO9K48o70OWWSAMe75jIu80qlvmaxeKmyaSUXsOfceR3%2Fyfhmd3dmhLVwnlVSdok7NWQ3OLEIH7VA1zH9%2FoigVFGD4tFW	Wl6yU2y71I5CtRlPuXPot5IXVWPGDangyQyJRENKjP8WMs0nbwxahwzR8SgSzDo%2F2AoAt8cXWDS3GzWCA%3D%3D",
-    TEAM_ID: "konnect-4",
-    CHANNEL: "C0565CS79D5",
-    CLAUDE_USER: "U056NDS2NE8",
+    TOKEN: "xoxc-5316505240308-5299474474855-5307406429942-04ec906ffb893be9c4a021e11dfc89627d8c08e1b1ff738dc9e92357ef561ef3",
+    COOKIE: "xoxd-0%2FLfT0RbWmKG8G%2FftdiqTScZRT9r4teytC2BXdFezm2fMVCZzbuFR%2B6t%2FgBjDeB3%2FoRZuQb7EAr5U9gi6iG5J%2FXkKY2nsF5gFbBo3jU2fXxFdKHgPlNovWZwRn85ZucWhyV87yuy7%2Bsdvw24ZD%2BUcsChnpGwpJbvMix2hRMqm92Gi%2BuW6JAgzdRH%2BA%3D%3D",
+    TEAM_ID: "Konnect-1",
+    CHANNEL: "C058TDYFSVD",
+    CLAUDE_USER: "U059810RT18",
 
     edit_msg_with_ping: true,
 
@@ -71,7 +71,7 @@ const config = {
         "My apologies",
         "upon further reflection",
         "continue this story",
-        "(unable to|not) (continue|respond|provide|appropriate)",
+        "(unable to|not|cannot) (continue|respond|provide|appropriate|assist)",
         "inappropriate",
         "content",
     ],
@@ -83,7 +83,7 @@ const config = {
     // WARN: if you this above 5 you are fucking yourself over because:
     // * it seems like there's a limited amount of Claude responses at the same time for each workspace, so you'll have to wait for every request to finish to get your next ones
     // * requests might poison one another, if one takes too long to start, maybe
-    multi_response: 3,
+    multi_response: 1,
     // delay between edits, could possibly be lower, didn't test it
     multi_response_delay: 50,
     // edit more times if the initial `multi_response` few get filtered
@@ -93,7 +93,7 @@ const config = {
     // it won't trigger Claude
     // it won't get all context
     delay_before_edit: 400,
-        
+
     // timeout if reply is taking too long to start being received
     reply_timeout_delay: 30 * 1000,
     // timeout if waiting just for the last multi reply
